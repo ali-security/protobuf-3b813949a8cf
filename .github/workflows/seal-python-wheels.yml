@@ -1,0 +1,241 @@
+name: seal-python-wheels
+
+# Upstream protobuf 3.12.4 has no GitHub Actions CI at all: the Python release was
+# built on Kokoro. This workflow reproduces that release, command for command, from
+# the specs that ARE in the tree:
+#   * kokoro/release/python/linux/build_artifacts.sh + config.sh -> the five
+#     manylinux1 CPython wheels (job "manylinux1")
+#   * python/release.sh                                          -> the sdist and the
+#     universal py2.py3 wheel (job "sdist-and-pure-wheel")
+# Tests are the project's own suite from python/tox.ini (the py{27,35,36,37,38}-python
+# environment) and release.sh's `python setup.py test`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional setuptools test suite selector (e.g. google.protobuf.internal.text_format_test). Empty runs the full suite."
+        required: false
+        default: ""
+
+env:
+  # Freeze pip to the 3.12.4 release moment so the build toolchain is the one that
+  # produced the public artifacts. setuptools 49.2.1 was published one day later, so
+  # 49.2.0 is the newest this index serves.
+  PIP_INDEX_URL: https://:2020-07-29T22:06:53.000000Z@time-machines-pypi.sealsecurity.io/
+  MANYLINUX_IMAGE: quay.io/pypa/manylinux1_x86_64:2021-08-21-78eb32a
+
+jobs:
+  manylinux1:
+    # kokoro/release/python/linux/build_artifacts.sh: one --cpp_implementation wheel
+    # per CPython, repaired with auditwheel to the manylinux1 platform tag.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # setuptools 49.2.0 requires Python >= 3.5, so the cp27 leg pins 44.1.1,
+          # the last Python 2 release of setuptools (and the one the image ships).
+          - pytag: cp27-cp27mu
+            setuptools: 44.1.1
+          - pytag: cp35-cp35m
+            setuptools: 49.2.0
+          - pytag: cp36-cp36m
+            setuptools: 49.2.0
+          - pytag: cp37-cp37m
+            setuptools: 49.2.0
+          - pytag: cp38-cp38
+            setuptools: 49.2.0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build protoc and libprotobuf (config.sh pre_build)
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE":/work -w /work \
+            "$MANYLINUX_IMAGE" \
+            bash -euxc '
+              ./autogen.sh
+              CXXFLAGS="-fPIC -g -O2" ./configure
+              # -j2 deliberately: at higher parallelism the compiler processes for
+              # src/google/protobuf/compiler/**/*.lo exhaust the runner memory and the
+              # kernel OOM-killer takes down the whole docker run (exit 143, which
+              # surfaces as an unexplained runner shutdown).
+              make -j2
+            '
+
+      - name: Test pure-python implementation (tox.ini py-python env)
+        # Runs on the pristine tree, BEFORE any --cpp_implementation build, so the
+        # pure-python suite is never polluted by the C++ extension artifacts.
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE":/work -w /work \
+            -e PIP_INDEX_URL \
+            -e PYTAG=${{ matrix.pytag }} \
+            -e SETUPTOOLS_VERSION=${{ matrix.setuptools }} \
+            -e PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python \
+            -e TEST_FILTER="${{ inputs.test-filter }}" \
+            "$MANYLINUX_IMAGE" \
+            bash -euxc '
+              export PATH=/opt/python/$PYTAG/bin:$PATH
+              python --version
+              pip install "setuptools==$SETUPTOOLS_VERSION" "wheel==0.34.2" "six>=1.9"
+              cd python
+              python setup.py -q build_py
+              python setup.py -q build
+              if [ -n "$TEST_FILTER" ]; then
+                python setup.py -q test -q -s "$TEST_FILTER"
+              else
+                python setup.py -q test -q
+              fi
+            '
+
+      - name: Build --cpp_implementation wheel (config.sh bdist_wheel_cmd)
+        run: |
+          # build_artifacts.sh applies this tweak to its staged copy; it is not in the
+          # 3.12.4 tag, and the sdist ships setup.py byte for byte, so it stays a
+          # workflow step rather than a source edit.
+          sed -i '/Wno-sign-compare/a \ \ \ \ \ \ \ \ extra_compile_args.append("-std=c++11")' python/setup.py
+          docker run --rm -v "$GITHUB_WORKSPACE":/work -w /work \
+            -e PIP_INDEX_URL \
+            -e PYTAG=${{ matrix.pytag }} \
+            -e SETUPTOOLS_VERSION=${{ matrix.setuptools }} \
+            "$MANYLINUX_IMAGE" \
+            bash -euxc '
+              export PATH=/opt/python/$PYTAG/bin:$PATH
+              pip install "setuptools==$SETUPTOOLS_VERSION" "wheel==0.34.2"
+              cd python
+              # Reset the python tree to its pre-test state, the way build_artifacts.sh
+              # starts every wheel from a fresh copy of the staged source.
+              python setup.py clean
+              rm -rf build dist
+              python setup.py build_py
+              python setup.py bdist_wheel --cpp_implementation --compile_static_extension
+              ls -l dist
+            '
+
+      - name: Repair wheel to manylinux1_x86_64
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE":/work -w /work \
+            -e PIP_INDEX_URL \
+            "$MANYLINUX_IMAGE" \
+            bash -euxc '
+              # auditwheel needs Python 3; it only inspects the wheel, so the repairing
+              # interpreter is independent of the wheel ABI tag.
+              /opt/python/cp38-cp38/bin/pip install "auditwheel==3.1.0"
+              /opt/python/cp38-cp38/bin/auditwheel repair --plat manylinux1_x86_64 -w wheelhouse python/dist/*.whl
+              ls -l wheelhouse
+            '
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: protobuf-manylinux1-${{ matrix.pytag }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  sdist-and-pure-wheel:
+    # python/release.sh's publish path: build (protoc must exist first, or `build`
+    # omits the well-known types), test, then `clean build sdist` and
+    # `clean build bdist_wheel`. python/setup.cfg sets [bdist_wheel] universal = 1,
+    # so the wheel comes out py2.py3-none-any.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.8"
+
+      - name: Install pinned build toolchain
+        run: python -m pip install "setuptools==49.2.0" "wheel==0.34.2" "six>=1.9"
+
+      - name: Build protoc
+        run: |
+          ./autogen.sh
+          ./configure
+          # -j2 deliberately: see the manylinux1 job: higher parallelism gets the
+          # compiler processes OOM-killed and the runner shut down.
+          make -j2
+
+      - name: Install sorted-requires shim
+        # The public sdist and pure wheel carry requires.txt / Requires-Dist SORTED
+        # ("setuptools" before "six>=1.9"), which no upstream setuptools release emits:
+        # they were built on a Debian/Ubuntu host whose distro-patched setuptools does
+        # `lines = map(append_cr, sorted(lines))`. Reproduce exactly that patch, for
+        # this job only, so python/setup.py's install_requires keeps the source order
+        # the five manylinux1 references need.
+        run: |
+          mkdir -p "$RUNNER_TEMP/seal-shim"
+          cat > "$RUNNER_TEMP/seal-shim/sitecustomize.py" <<'PY'
+          import io
+          import os
+
+          from setuptools.command import egg_info as _egg_info
+          from setuptools.command import install_egg_info as _install_egg_info
+
+          _upstream_write_requirements = _egg_info._write_requirements
+
+
+          def _write_requirements(stream, reqs):
+              buf = io.StringIO()
+              _upstream_write_requirements(buf, reqs)
+              for line in sorted(buf.getvalue().splitlines()):
+                  stream.write(line + "\n")
+
+
+          _egg_info._write_requirements = _write_requirements
+
+
+          # The same Debian patch also drops the "-pyX.Y" suffix from the
+          # egg-info basename, which is what names the generated
+          # namespace-package .pth file. Upstream setuptools emits
+          # "protobuf-3.12.4-py3.8-nspkg.pth"; the reference pure wheel
+          # carries "protobuf-3.12.4-nspkg.pth" with identical contents.
+          def _finalize_options(self):
+              self.set_undefined_options("install_lib", ("install_dir", "install_dir"))
+              ei_cmd = self.get_finalized_command("egg_info")
+              basename = "%s-%s.egg-info" % (ei_cmd.egg_name, ei_cmd.egg_version)
+              self.source = ei_cmd.egg_info
+              self.target = os.path.join(self.install_dir, basename)
+              self.outputs = []
+
+
+          _install_egg_info.install_egg_info.finalize_options = _finalize_options
+          PY
+          cat "$RUNNER_TEMP/seal-shim/sitecustomize.py"
+          echo "PYTHONPATH=$RUNNER_TEMP/seal-shim" >> "$GITHUB_ENV"
+
+      - name: Build and test (release.sh local test step)
+        run: |
+          cd python
+          python setup.py build
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            python setup.py test -q -s "${{ inputs.test-filter }}"
+          else
+            python setup.py test
+          fi
+
+      - name: Build sdist
+        run: |
+          cd python
+          python setup.py clean build sdist
+
+      - name: Build universal wheel
+        run: |
+          cd python
+          python setup.py clean build bdist_wheel
+          ls -l dist
+
+      - name: Upload sdist and universal wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: protobuf-sdist-and-pure-wheel
+          path: |
+            python/dist/*.tar.gz
+            python/dist/*.whl
+          if-no-files-found: error
